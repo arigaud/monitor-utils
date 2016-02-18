@@ -15,6 +15,8 @@
 ## ran.leibman@gmail.com
 ## Additionial checks code written
 ## by laurent.dufour@havas.com
+## updated by X. Franco & A. Rigaud
+## 20160211 : Added FSSTATUS/SNAPSHOTAGE
 ##
 ## the following parameters has
 ## been tested against a 
@@ -46,8 +48,8 @@ Getopt::Long::Configure('bundling');
 my $stat = 0;
 my $msg;
 my $perf;
-my $script_name = "check-netapp-ng.pl";
-my $script_version = 1.2;
+my $script_name = basename($0);
+my $script_version = 1.3;
 
 my $counterFilePath="/tmp";
 my $counterFile;
@@ -154,6 +156,10 @@ my $snmp_netapp_volume_id_table_df_free = "$snmp_netapp_volume_id_table_df.5";
 my $snmp_netapp_volume_id_table_df_used_prec = "$snmp_netapp_volume_id_table_df.6";
 my $snmp_netapp_volume_id_table_df_used_high = "$snmp_netapp_volume_id_table_df.16";
 my $snmp_netapp_volume_id_table_df_used_low = "$snmp_netapp_volume_id_table_df.17";
+
+my $snmpfsOverallStatus = '1.3.6.1.4.1.789.1.5.7.1.0';
+my $snmpfsOverallStatus_text = '1.3.6.1.4.1.789.1.5.7.2.0';
+
 # 64bit values for SNMP v2c
 my $snmp_netapp_volume_id_table_df64_total = "$snmp_netapp_volume_id_table_df.29";
 my $snmp_netapp_volume_id_table_df64_used = "$snmp_netapp_volume_id_table_df.30";
@@ -198,6 +204,15 @@ my $snmp_netapp_blocks_iscsi64WriteBytes = "$snmp_netapp_blocks.23.0";
 my $snmp_netapp_blocks_fcp64Ops = "$snmp_netapp_blocks.25.0";
 my $snmp_netapp_blocks_fcp64ReadBytes = "$snmp_netapp_blocks.20.0";
 my $snmp_netapp_blocks_fcp64WriteBytes = "$snmp_netapp_blocks.21.0";
+
+### SNAPSHOT OIDs
+### You can browse at http://www.oidview.com/mibs/789/NETWORK-APPLIANCE-MIB.html
+###############
+
+my $snmp_filesys_snapshot_slVTable_slVEntry = '.1.3.6.1.4.1.789.1.5.5.2.1';
+my $snmp_filesys_snapshot_slVTable_slVEntry_index = "$snmp_filesys_snapshot_slVTable_slVEntry.1";
+my $snmp_filesys_snapshot_slVTable_slVEntry_number = "$snmp_filesys_snapshot_slVTable_slVEntry.8";
+my $snmp_filesys_snapshot_slVTable_slVEntry_Vname = "$snmp_filesys_snapshot_slVTable_slVEntry.9";
 
 # SNMP Status Codes
 my %nvramBatteryStatus = (
@@ -284,8 +299,16 @@ my %EcnlStatusIndex = (
 	5 => 'reconfiguring',
 	6 => 'nonexistent',
 );
+
+my %fsOverallStatusIndex = (
+        1 => 'ok',
+        2 => 'Nearly Full',
+        3 => 'Full',
+);
+
 ### Functions
 ###############
+
 
 
 sub _create_session(@) {
@@ -316,7 +339,7 @@ This is $script_name in version $script_version.
     -v <vol_path|aggr_name> Volume Name in format /vol/volname/ 
                             or aggregate name (not available in 7.x ONTAP)
                             For available values use any word, such as \'-v whatever\'
-    -e <vol1[,vol2[,...]]>  Exclude volumes from snap check (SNAPSHOT)
+    -e <vol1[,vol2[,...]]>  Exclude volumes from snap check (SNAPSHOT/SNAPSHOTAGE)
     -I                      Inform only, return OK every time (ignore -w and -c values)
     -h                      This help
 
@@ -328,6 +351,7 @@ This is $script_name in version $script_version.
     NVRAM             - NVram Battery Status
     DISKUSED          - Usage Percentage of volume or aggregate (-w -c -v)
     SNAPSHOT          - Snapshot Config (-e volname,volname2,volname3)
+    SNAPSHOTAGE       - Check the age of volume snapshot which are older than x days (-w -c -v -e)
     SHELF             - Shelf Health
     SHELFINFO         - Shelf Model & Temperature Information
     NFSOPS            - Nfs Ops per seconds (-w -c)
@@ -343,6 +367,7 @@ This is $script_name in version $script_version.
     FAILEDDISK        - Number of failed disks
     UPTIME            - Only show\'s uptime
     CACHEAGE          - Cache Age (-w -c)
+    FSSTATUS          - Overall file system health
 
   Examples:
     $script_name -H netapp.mydomain -C public -T UPTIME
@@ -447,6 +472,17 @@ sub _ulong64(@) {
         return ($high<<32)|$low; 
 }
 
+sub uniq(@) {
+        my @array = @_;
+        my @unique = ();
+        my %seen   = ();
+
+        foreach my $elem ( @array ) {
+                next if $seen{ $elem }++;
+                push @unique, $elem;
+        }
+        return @unique;
+}
 
 ### Gather input from user
 #############################
@@ -498,7 +534,7 @@ if (!defined($counterFilePath)) {
 
 
 
-# Starting Alaram
+# Starting Alarm
 alarm($TIMEOUT);
 
 # Establish SNMP Session
@@ -724,7 +760,7 @@ if("$opt{'check_type'}" eq "TEMP") {
                         }
 			my $used_prec = _get_oid_value($snmp_session,"$snmp_netapp_volume_id_table_df_used_prec.$oid");
 
-			($msg,$stat) = _clac_err_stat($used_prec,$opt{'check_type'},$opt{'warn'},$opt{'crit'});
+			($msg,$stat) = _clac_err_stat($used_prec,"$opt{'check_type'} $opt{'vol'}",$opt{'warn'},$opt{'crit'});
 
                         # https://nagios-plugins.org/doc/guidelines.html
                         # 'label'=value[UOM];[warn];[crit];[min];[max]
@@ -739,7 +775,115 @@ if("$opt{'check_type'}" eq "TEMP") {
                         next if ( !( ($$r_vol_tbl{$key} =~ m#^/vol/.*/$#) or ($$r_vol_tbl{$key} =~ m#^[^/]*$#) ) );
                         $msg .= " $$r_vol_tbl{$key}"
                 }
-        }                
+        }
+### SNAPSHOTAGE ###
+} elsif("$opt{'check_type'}" eq "SNAPSHOTAGE") {
+
+        my @exc_list = split(',',$opt{'exclude'});
+        my @vol_list;
+        my @vol_id;
+        my @vol_err_ok;
+        my @vol_err_war;
+        my @vol_err_cri;
+        my $loc_mon=(localtime(time()))[4]+1;
+        my $loc_year=(localtime(time()))[5]+1900;
+        my $loc_time = time();
+        my $badcount = 0;
+        my $r_snap_tbl = $snmp_session->get_table($snmp_filesys_snapshot_slVTable_slVEntry);
+        my $r_vol_tbl = $snmp_session->get_table($snmp_filesys_snapshot_slVTable_slVEntry_number);
+        foreach my $key ( keys %$r_vol_tbl) {
+                my @tmp_oid = split(/\./, $key);
+                my $nb_col = scalar @tmp_oid;
+                push(@vol_list,"$tmp_oid[$nb_col-2]");
+        }
+        @vol_id = uniq(@vol_list);
+        foreach my $vol_id (@vol_id) {
+                my $Snap_year;
+                my $key_tmp = "$snmp_filesys_snapshot_slVTable_slVEntry_number.$vol_id.1";
+                my $Nb_Snap = "$$r_vol_tbl{$key_tmp}";
+                my $key_tmp = "$snmp_filesys_snapshot_slVTable_slVEntry.9.$vol_id.$Nb_Snap";
+                my $Vol_Name = "$$r_snap_tbl{$key_tmp}";
+                my $key_tmp = "$snmp_filesys_snapshot_slVTable_slVEntry.2.$vol_id.$Nb_Snap";
+                my $Snap_mon = "$$r_snap_tbl{$key_tmp}";
+                my $key_tmp = "$snmp_filesys_snapshot_slVTable_slVEntry.3.$vol_id.$Nb_Snap";
+                my $Snap_day = "$$r_snap_tbl{$key_tmp}";
+                my $key_tmp = "$snmp_filesys_snapshot_slVTable_slVEntry.4.$vol_id.$Nb_Snap";
+                my $Snap_hour = "$$r_snap_tbl{$key_tmp}";
+                my $key_tmp = "$snmp_filesys_snapshot_slVTable_slVEntry.5.$vol_id.$Nb_Snap";
+                my $Snap_min = "$$r_snap_tbl{$key_tmp}";
+                if ( $loc_mon >= $Snap_mon ) {
+                        $Snap_year = $loc_year;
+                } else {
+                        $Snap_year = $loc_year-1;
+                }
+                my $Snap_time = timelocal(0,$Snap_min,$Snap_hour,$Snap_day,$Snap_mon-1,$Snap_year);
+                my $Snap_delta = sprintf("%.2f", ($loc_time-$Snap_time)/86400);
+
+                #print "Localtime : ".localtime($loc_time)." \n";
+                #print "Localtime : ".localtime($Snap_time)." \n";
+                #print "Vol_id=$vol_id Nb_Snap=$Nb_Snap Vol_Name=$Vol_Name Snap_mon=$Snap_mon Snap_day=$Snap_day Snap_hour=$Snap_hour Snap_min=$Snap_min localtime=$loc_time snap_time=$Snap_time Snap_delta=$Snap_delta War=$opt{'warn'} Crit=$opt{'crit'}\n";
+
+                if (defined $opt{'vol'}) {
+                        if ($opt{'vol'} eq "/vol/$Vol_Name/") {
+                                if($Snap_delta > $opt{'warn'} and $Snap_delta < $opt{'crit'}) {
+                                        push(@vol_err_war, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                                } elsif($Snap_delta >= $opt{'crit'}) {
+                                        push(@vol_err_cri, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                                } else {
+                                        push(@vol_err_ok, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                                }
+                        }
+                } elsif (defined $opt{'exclude'}) {
+                        my $volcheck = 0;
+                        foreach my $exvol (@exc_list) {
+                                if ($exvol eq "/vol/$Vol_Name/") {
+                                        $volcheck++;
+                                        #print "Exclude\n";
+                                }
+                        }
+                        if($volcheck == 0) {
+                                if($Snap_delta > $opt{'warn'} and $Snap_delta < $opt{'crit'}) {
+                                        push(@vol_err_war, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                                } elsif($Snap_delta >= $opt{'crit'}) {
+                                        push(@vol_err_cri, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                                } else {
+                                        push(@vol_err_ok, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                                }
+                        }
+                } else {
+                        if($Snap_delta > $opt{'warn'} and $Snap_delta < $opt{'crit'}) {
+                                push(@vol_err_war, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                        } elsif($Snap_delta >= $opt{'crit'}) {
+                                push(@vol_err_cri, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                        } else {
+                                push(@vol_err_ok, "/vol/".$Vol_Name."/ : ".$Snap_delta."");
+                        }
+                }
+        }
+        my $err_ok = $#vol_err_ok + 1;
+        my $err_war = $#vol_err_war + 1;
+        my $err_cri = $#vol_err_cri + 1;
+        $badcount += ($err_war+$err_cri);
+
+        if (($err_cri == 0) && ($err_war == 0) && ($err_ok != 0)) {
+                $stat = $ERRORS{'OK'};
+                $msg = "OK: $opt{'check_type'} @vol_err_ok ";
+        } elsif ($err_cri != 0) {
+                $stat = $ERRORS{'CRITICAL'};
+                $msg = "CRIT : $opt{'check_type'} $badcount outdated snapshots found, @vol_err_cri days old (> $opt{'crit'} d)";
+        } elsif ($err_war != 0) {
+                $stat = $ERRORS{'WARNING'};
+                $msg = "WARN: $opt{'check_type'} $badcount outdated snapshots found, @vol_err_war days old (> $opt{'warn'} d)";
+                } elsif (defined $opt{'vol'}) {
+                $err_war = 1;
+                $stat = $ERRORS{'WARNING'};
+                $msg = "WARN: $opt{'check_type'} Unknown volume path name '$opt{'vol'}'. example \"/vol/vol0/\"";
+        } else {
+                $stat = $ERRORS{'UNKNOWN'};
+                $msg = "UNKNOW Errors";
+        }
+$perf = "outdated_snapshots=$badcount";
+
 ### SNAPSHOT ###
 } elsif("$opt{'check_type'}" eq "SNAPSHOT") {
 	my @exc_list = split(',',$opt{'exclude'});
@@ -775,6 +919,7 @@ if("$opt{'check_type'}" eq "TEMP") {
 		$msg = "CRIT: $opt{'check_type'} @vol_err not configured";
 	}
 	$perf = "snapoff=$err_count";
+
 ### FAILEDDISK ###
 } elsif("$opt{'check_type'}" eq "FAILEDDISK") {
 	my $check = _get_oid_value($snmp_session,$snmpFailedDiskCount);
@@ -976,11 +1121,28 @@ if("$opt{'check_type'}" eq "TEMP") {
 		else
 		{ $perf = "shelf=1"; }
 	}
+### FSSTATUS ###
+} elsif("$opt{'check_type'}" eq "FSSTATUS") {
+        my $check = _get_oid_value($snmp_session,$snmpfsOverallStatus);
+        my $global_stat_txt = _get_oid_value($snmp_session,$snmpfsOverallStatus_text);
+        if($check == 1) {
+                $stat = $ERRORS{'OK'};
+                $msg = "OK: $opt{'check_type'} $fsOverallStatusIndex{$check} $check $global_stat_txt";
+        }elsif($check == 2) {
+                $stat = $ERRORS{'WARNING'};
+                $msg = "WARN: $opt{'check_type'} $fsOverallStatusIndex{$check} $check $global_stat_txt";
+        } else {
+                $stat = $ERRORS{'CRITICAL'};
+                $msg = "CRIT: $opt{'check_type'} $fsOverallStatusIndex{$check} $check $global_stat_txt";
+        }
+        $perf = "fsstatus=$check";
+
 ### Syntax Error ###
 } else {
 	FSyntaxError("$opt{'check_type'} invalid parameter !");
 }
 
+$msg =~ s/\n//g;
 $perf ? print "$msg | $perf\n" : print "$msg\n";
 
 exit($stat);
